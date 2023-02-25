@@ -1,0 +1,109 @@
+1. Git clone the forked repo to the laptop
+------------------------------------------
+git clone git@github.com:ztoth123/acr-build-helloworld-node.git
+
+2. Use Azure Bash Cloud Shell to create:
+----------------------------------------
+> a resource group
+> an ACR within the rg
+
+ACR_NAME=testacrztoth
+
+RES_GROUP=$ACR_NAME-rg # Resource Group name
+
+az group create --resource-group $RES_GROUP --location westeurope
+az acr create --resource-group $RES_GROUP --name $ACR_NAME --sku Standard --location westeurope
+
+3. Use ACR tasks to build and store the image in ACR repo:
+----------------------------------------------------------
+> image name: helloacrtasks:v1
+> registry: testacrztoth.azurecr.io
+> repo: helloacrtasks
+
+az acr build --registry $ACR_NAME --image helloacrtasks:v1 https://github.com/ztoth123/acr-build-helloworld-node -f Dockerfile
+
+- image:
+    registry: testacrztoth.azurecr.io
+    repository: helloacrtasks
+    tag: v1
+    digest: sha256:b1b4c18ce3bb38f88c9b127e7513c4ed5b328b2bc962aa820cad2cb2ba66e995
+  runtime-dependency:
+    registry: registry.hub.docker.com
+    repository: library/node
+    tag: 15-alpine
+    digest: sha256:6edd37368174c15d4cc59395ca2643be8e2a1c9846714bc92c5f5c5a92fb8929
+  git:
+    git-head-revision: 88a601d8386da4b5212fa4a5018ee5d3258ab8a5
+
+4. Deploy to ACI
+----------------
+4.1 Create a Key Vault
+----------------------
+AKV_NAME=$ACR_NAME-vault
+
+az keyvault create --resource-group $RES_GROUP --name $AKV_NAME
+
+4.2 Create a service principal and store credentials in the key vault
+---------------------------------------------------------------------
+# Create service principal, store its password in AKV (the registry *password*)
+az keyvault secret set \
+  --vault-name $AKV_NAME \
+  --name $ACR_NAME-pull-pwd \
+  --value $(az ad sp create-for-rbac \
+                --name $ACR_NAME-pull \
+                --scopes $(az acr show --name $ACR_NAME --query id --output tsv) \
+                --role acrpull \
+                --query password \
+                --output tsv)
+
+4.3 Store the service principal's appId in the vault, which is the username you pass to Azure Container Registry for authentication:
+-----------------------------------------------------------------
+# Store service principal ID in AKV (the registry *username*)
+az keyvault secret set \
+    --vault-name $AKV_NAME \
+    --name $ACR_NAME-pull-usr \
+    --value $(az ad sp list --display-name $ACR_NAME-pull --query [].appId --output tsv)
+
+You've created an Azure Key Vault and stored two secrets in it:
+---------------------------------------------------------------
+    $ACR_NAME-pull-usr: The service principal ID, for use as the container registry username.
+    $ACR_NAME-pull-pwd: The service principal password, for use as the container registry password.
+
+You can now reference these secrets by name when you or your applications and services pull images from the registry.
+
+4.4 Deploy a container with Azure CLI to ACI
+--------------------------------------------
+az container create \
+    --resource-group $RES_GROUP \
+    --name acr-tasks \
+    --image $ACR_NAME.azurecr.io/helloacrtasks:v1 \
+    --registry-login-server $ACR_NAME.azurecr.io \
+    --registry-username $(az keyvault secret show --vault-name $AKV_NAME --name $ACR_NAME-pull-usr --query value -o tsv) \
+    --registry-password $(az keyvault secret show --vault-name $AKV_NAME --name $ACR_NAME-pull-pwd --query value -o tsv) \
+    --dns-name-label acr-tasks-$ACR_NAME \
+    --query "{FQDN:ipAddress.fqdn}" \
+    --output table
+
+FQDN
+---------------------------------------------------
+acr-tasks-testacrztoth.westeurope.azurecontainer.io
+
+5. Verify the deployment
+------------------------
+az container attach --resource-group $RES_GROUP --name acr-tasks
+
+Container 'acr-tasks' is in state 'Running'...
+(count: 1) (last timestamp: 2023-02-25 16:24:40+00:00) pulling image "testacrztoth.azurecr.io/helloacrtasks@sha256:b1b4c18ce3bb38f88c9b127e7513c4ed5b328b2bc962aa820cad2cb2ba66e995"
+(count: 1) (last timestamp: 2023-02-25 16:24:47+00:00) Successfully pulled image "testacrztoth.azurecr.io/helloacrtasks@sha256:b1b4c18ce3bb38f88c9b127e7513c4ed5b328b2bc962aa820cad2cb2ba66e995"
+(count: 1) (last timestamp: 2023-02-25 16:24:57+00:00) Started container
+
+Start streaming logs:
+Server running at http://localhost: 80
+-----------------------------------------
+
+in a browser:
+-------------
+http://acr-tasks-testacrztoth.westeurope.azurecontainer.io
+
+Hello World
+Version: 15.14.0
